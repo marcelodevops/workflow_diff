@@ -1,0 +1,154 @@
+name: Python CI
+
+on:
+  pull_request:
+    branches: [ master, development ]
+    paths:
+      - 'src/python/**'
+  push:
+    branches: [ master, development ]
+    paths:
+      - 'src/python/**'
+env:
+  COMMIT_REF: ${GITHUB_SHA}
+  ACTION_VERSION: v1.31
+  CLI_VERSION: '358.0.0'
+  LINT_ARGS: --disable=C0301 --disable=C0326 --disable=R1732 --disable=W1514
+  # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+  FLAKE_ARGS: --ignore=E501,E231 --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+  PY_SRC_DIR: 'src/python/**/'
+  POLARIS_PROJECT_NAME: Data Enablement - Dataflow Templates
+
+
+jobs:
+
+  generate-matrix:
+    name: Generate matrix for build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check changed files
+        id: diff
+        run: |
+          if [ $GITHUB_BASE_REF ]; then
+            # Pull Request
+            git fetch origin $GITHUB_BASE_REF --depth=3
+            export DIFF=$( git diff --name-only --diff-filter=ACMRT origin/$GITHUB_BASE_REF $GITHUB_SHA )
+            echo "Diff between origin/$GITHUB_BASE_REF and $GITHUB_SHA"
+          else
+            # Push
+            git fetch origin ${{ github.event.before }} --depth=3
+            export DIFF=$( git diff --name-only --diff-filter=ACMRT ${{ github.event.before }} $GITHUB_SHA )
+            echo "Diff between ${{ github.event.before }} and $GITHUB_SHA"
+          fi
+          echo "$DIFF"
+          # Escape newlines (replace \n with %0A)
+          echo "::set-output name=diff::$( echo "$DIFF" | sed ':a;N;$!ba;s/\n/%0A/g' )"
+
+      - name: Set matrix for build
+        id: set-matrix
+        run: |
+          DIFF="${{ steps.diff.outputs.diff }}"
+          echo $DIFF
+          JSON="{\"include\":["
+
+          # Loop by lines
+          while read path; do
+            # Set $directory to substring before /
+            pydir="$( echo $path | cut -d'/' -f2 -s )"
+            targetdir="$( echo $path | sed 's|\(.*\)/.*|\1|' )"
+
+            if [ -z "$targetdir" ]; then
+              continue # Exclude if directory does not exist
+            elif [ "$pydir" != "python" ]; then
+              continue # Exclude any directory outside src/python directory
+            fi
+
+            # Add directory to the matrix only if it is not already included
+            JSONline="{\"targetdir\": \"$targetdir\"},"
+            if [[ "$JSON" != *"$JSONline"* ]]; then
+              JSON="$JSON$JSONline"
+            fi
+          done <<< "$DIFF"
+
+          # Remove last "," and add closing brackets
+          if [[ $JSON == *, ]]; then
+            JSON="${JSON%?}"
+          fi
+          JSON="$JSON]}"
+          echo $JSON
+
+          # Set output
+          echo "::set-output name=matrix::$( echo "$JSON" )"
+  test:
+    name: Testing "${{ matrix.targetdir }}"
+    needs: generate-matrix
+    strategy:
+      matrix: ${{fromJson(needs.generate-matrix.outputs.matrix)}}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.targetdir }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v2
+      - name: Setup Python environment
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
+      - name: Install requirements
+        run: |
+          pip install --quiet pylint flake8 coverage
+          pip install -r requirements.txt
+      - name: Pylint
+        run: |
+          pylint ${{ env.LINT_ARGS }} .
+      - name: Flake8
+        run: |
+          flake8 . ${{ env.FLAKE_ARGS }}
+      - name: Python Test and coverage
+        run: |
+          echo "commented out to test the full workflow"
+          # coverage run --source src.python -m unittest discover && coverage report
+
+  upload_metadata_job: #build on push dev master
+    name: Upload metadata template
+    if: github.event_name == 'push'
+    needs: generate-matrix
+    strategy:
+      matrix: ${{fromJson(needs.generate-matrix.outputs.matrix)}}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_email: ${{ secrets.SERVICE_ACCOUNT_EMAIL }}
+          service_account_key: ${{ secrets.SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+      - name: Install jq tool
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+      - name: Get template url
+        id: templateurl
+        run: echo "::set-output name=templateurl::$(jq -r .template_url ${{ matrix.targetdir }}/workflow-params.json)"
+      - name: Upload metadata json template to GCS
+        env:
+          TEMPLATE_PATH: "gs://${{ secrets.TEMPLATE_BUCKET }}/dataflow/templates/${{ steps.templateurl.outputs.templateurl }}.json"
+          TEMPLATE_IMAGE: "${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/dataflow/${{ steps.templateurl.outputs.templateurl }}:latest"
+          LOCAL_METADATA_FILENAME: "${{ matrix.targetdir }}/metadata.json"
+          DOCKERFILE_LOCATION: "${{ matrix.targetdir }}/"
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT }}
+        id: flex-template
+        run: |
+          gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev
+          docker build . -f ${{ env.DOCKERFILE_LOCATION }}Dockerfile -t ${{ env.TEMPLATE_IMAGE }}
+          docker image push ${{ env.TEMPLATE_IMAGE }}
+          gcloud dataflow flex-template build ${{ env.TEMPLATE_PATH }} \
+            --image "${{ env.TEMPLATE_IMAGE }}" \
+            --sdk-language "PYTHON" \
+            --metadata-file ${{ env.LOCAL_METADATA_FILENAME }}

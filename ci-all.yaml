@@ -1,0 +1,40 @@
+name: CI pipeline - All Changes
+on:
+  push:
+    branches: [ master, development ]
+  pull_request:
+    branches: [ master, development ]
+jobs:
+  editor-config:
+    name: Editor Config Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Editor Config
+        run: npm install editorconfig-checker
+      - name: Run Editor Config
+        run: ./node_modules/.bin/editorconfig-checker -disable-indent-size -v .
+  analyze:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Code analysis with Coverity
+        run: |
+          export POLARIS_SERVER_URL=${{ secrets.POLARIS_SERVER_URL}}
+          export POLARIS_ACCESS_TOKEN=${{ secrets.POLARIS_ACCESS_TOKEN}}
+          export GIT_BRANCH=${GITHUB_REF}
+          wget -q ${{ secrets.POLARIS_SERVER_URL}}/api/tools/polaris_cli-linux64.zip
+          unzip -j polaris_cli-linux64.zip -d /tmp
+          /tmp/polaris --co "project.name=\"${{ env.POLARIS_PROJECT_NAME }}\"" analyze --coverity-ignore-capture-failure -w
+  whitesource:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download WhiteSource
+        run: curl -LJO "${{ secrets.WS_JAR_URL }}"
+      - name: Run WhiteSource
+        run: java -jar wss-unified-agent.jar -apiKey "${{ secrets.WS_API_KEY }}" -product "${{ secrets.WS_PRODUCT }}" -project "${{ secrets.WS_PROJECT }}" -wss.url "${{ secrets.WS_SERVER_URL }}"
+
+

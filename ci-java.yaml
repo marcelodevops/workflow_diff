@@ -1,0 +1,183 @@
+name: Java CI
+on:
+  push:
+    branches: [ master, development ]
+    paths:
+      - 'src/java/**'
+  pull_request:
+    branches: [ master, development ]
+    paths:
+      - 'src/java/**'
+env:
+  CLI_VERSION: '358.0.0'
+  JAVA_SRC_DIR: 'src/java'
+  POLARIS_PROJECT_NAME: Data Enablement - Dataflow Templates
+
+
+jobs:
+  generate-matrix:
+    name: Generate matrix for build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Check changed files
+        id: diff
+        run: |
+          if [ $GITHUB_BASE_REF ]; then
+            # Pull Request
+            git fetch origin $GITHUB_BASE_REF --depth=3
+            export DIFF=$( git diff --name-only --diff-filter=ACMRT origin/$GITHUB_BASE_REF $GITHUB_SHA )
+            echo "Diff between origin/$GITHUB_BASE_REF and $GITHUB_SHA"
+          else
+            # Push
+            git fetch origin ${{ github.event.before }} --depth=3
+            export DIFF=$( git diff --name-only --diff-filter=ACMRT ${{ github.event.before }} $GITHUB_SHA )
+            echo "Diff between ${{ github.event.before }} and $GITHUB_SHA"
+          fi
+          echo "$DIFF"
+          # Escape newlines (replace \n with %0A)
+          echo "::set-output name=diff::$( echo "$DIFF" | sed ':a;N;$!ba;s/\n/%0A/g' )"
+
+      - name: Set matrix for build
+        id: set-matrix
+        run: |
+          JAVADIR="${{ env.JAVA_SRC_DIR }}"
+          DIFF="${{ steps.diff.outputs.diff }}"
+          echo $DIFF
+          JSON="{\"include\":["
+
+          # Loop by lines
+          while read path; do
+            jdir="$( echo $path | cut -d'/' -f2 -s )"
+            pdir="$( echo $path | cut -d'/' -f3 -s )"
+            if [ "$jdir" == "java" ]; then
+              targetdir="$JAVADIR/$pdir"
+            else
+              targetdir=""
+            fi
+            echo "targetdir: $targetdir"
+
+            if [ -z "$targetdir" ]; then
+              continue # Exclude if directory is empty
+            elif [ -f "$targetdir" ]; then
+              continue # Exclude if argument is not a directory but a file
+            elif [ "$jdir" != "java" ]; then
+              continue # Exclude any directory outside src/java directory
+            elif [ "$pdir" == "common" ]; then
+              continue # Exclude common directory inside src/java
+            fi
+
+            # Add directory to the matrix only if it is not already included
+            JSONline="{\"targetdir\": \"$pdir\"},"
+            if [[ "$JSON" != *"$JSONline"* ]]; then
+              JSON="$JSON$JSONline"
+            fi
+          done <<< "$DIFF"
+
+          # Remove last "," and add closing brackets
+          if [[ $JSON == *, ]]; then
+            JSON="${JSON%?}"
+          fi
+          JSON="$JSON]}"
+          echo $JSON
+
+          # Set output
+          echo "::set-output name=matrix::$( echo "$JSON" )"
+  test:
+    name: Testing ${{ matrix.targetdir }}
+    needs: generate-matrix
+    strategy:
+      matrix: ${{fromJson(needs.generate-matrix.outputs.matrix)}}
+    if: ${{ needs.generate-matrix.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    defaults:
+        run:
+          working-directory: ${{ env.JAVA_SRC_DIR }}
+    env:
+      PDIR: ${{ matrix.targetdir }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up JDK 11
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+      - name: Cache the Maven packages to speed up build
+        uses: actions/cache@v2
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: Test with Maven
+        run: mvn --batch-mode --update-snapshots verify -pl common -pl ${{ env.PDIR }}
+      - name: Checkstyle
+        run: mvn  checkstyle::check -pl ${{ env.PDIR }}
+
+  upload_metadata_job: #build on push dev master
+    name: Upload metadata template
+    needs: generate-matrix
+    strategy:
+      matrix: ${{fromJson(needs.generate-matrix.outputs.matrix)}}
+    if: ${{ needs.generate-matrix.outputs.matrix != '[]' }} && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+        run:
+          working-directory: ${{ env.JAVA_SRC_DIR }}
+    env:
+      PDIR: ${{ matrix.targetdir }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          service_account_email: ${{ secrets.SERVICE_ACCOUNT_EMAIL }}
+          service_account_key: ${{ secrets.SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+      - name: Install jq tool
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+      - name: Get template url
+        id: jsonparams
+        env:
+          JSON_PARAMS_FILE: ${{ env.PDIR }}/workflow-params.json
+        run: |
+          echo "::set-output name=templateurl::$(jq -r .template_url $JSON_PARAMS_FILE)"
+          echo "::set-output name=templatename::$(jq -r .template_name $JSON_PARAMS_FILE)"
+          echo "::set-output name=templatejavamainclass::$(jq -r .template_java_main_class $JSON_PARAMS_FILE)"
+      - name: Set up JDK 11
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+      - name: Cache the Maven packages to speed up build
+        uses: actions/cache@v2
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+      - name: Build with Maven
+        run: |
+          mvn clean compile -pl common -pl ${{ env.PDIR }}
+          mvn package -am -pl ${{ env.PDIR }}
+      - name: Upload metadata json template to GCS
+        env:
+          PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+          BUCKET_NAME: ${{ secrets.GCP_BUCKET_NAME }}
+          TEMPLATE_NAME: "dataflow/${{ steps.jsonparams.outputs.templatename }}/metadata.json"
+          IMAGE: "${{ secrets.GCP_PROJECT_ID }}/${{ steps.jsonparams.outputs.templateurl }}"
+          PATH_TO_METADATA_JSON: "${{ env.PDIR }}/src/main/resources/metadata.json"
+          PATH_TO_JAR: "${{ env.PDIR }}/target/kafkatopubsub-1.0-SNAPSHOT.jar"
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.SERVICE_ACCOUNT }}
+          TEMPLATE_JAVA_MAIN_CLASS: ${{ steps.jsonparams.outputs.templatejavamainclass }}
+        run: |
+            gcloud dataflow flex-template build gs://$BUCKET_NAME/$TEMPLATE_NAME \
+            --image-gcr-path "gcr.io/$PROJECT/$IMAGE:latest" \
+            --sdk-language "JAVA" \
+            --flex-template-base-image gcr.io/dataflow-templates-base/java11-template-launcher-base \
+            --metadata-file $PATH_TO_METADATA_JSON \
+            --jar $PATH_TO_JAR \
+            --env FLEX_TEMPLATE_JAVA_MAIN_CLASS="$TEMPLATE_JAVA_MAIN_CLASS"
